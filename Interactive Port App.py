@@ -125,11 +125,10 @@ def sharpe_ratio(r: pd.Series, rf: float) -> float:
 def sortino_ratio(r: pd.Series, rf: float) -> float:
     rf_daily = rf / TD
     excess = r - rf_daily
-    downside = excess[excess < 0]
-    if len(downside) == 0:
-        return np.nan
-    downside_std = np.sqrt((downside ** 2).mean()) * np.sqrt(TD)
-    if downside_std == 0:
+    # Downside deviation: square only negative excess returns, normalize by TOTAL obs
+    downside_sq = np.minimum(excess, 0.0) ** 2
+    downside_std = np.sqrt(downside_sq.mean()) * np.sqrt(TD)
+    if downside_std == 0 or np.isnan(downside_std):
         return np.nan
     return (r.mean() * TD - rf) / downside_std
 
@@ -186,7 +185,6 @@ def portfolio_metrics(w, ret_df, rf):
     }
 
 
-@st.cache_data(show_spinner=False)
 def optimize_gmv(ret_values: np.ndarray, n: int):
     """Global Minimum Variance portfolio. Cached on raw return array."""
     ret_df = pd.DataFrame(ret_values)
@@ -205,15 +203,27 @@ def optimize_gmv(ret_values: np.ndarray, n: int):
     return res.x if res.success else None
 
 
-@st.cache_data(show_spinner=False)
 def optimize_tangency(ret_values: np.ndarray, n: int, rf: float):
-    """Maximum Sharpe (tangency) portfolio."""
+    """Maximum Sharpe (tangency) portfolio.
+
+    Returns (weights, warning_msg). If the problem is ill-posed (e.g., rf
+    exceeds all asset returns) or SLSQP fails, falls back to GMV weights
+    and returns a warning message.
+    """
     ret_df = pd.DataFrame(ret_values)
     mean_ret = ret_df.mean().values
     cov = ret_df.cov().values
     w0 = np.full(n, 1 / n)
     cons = {"type": "eq", "fun": lambda w: w.sum() - 1}
     bounds = [(0, 1)] * n
+
+    # Guard: if every asset's annualized return is below rf, max-Sharpe is ill-posed.
+    if (mean_ret * TD).max() <= rf:
+        gmv = optimize_gmv(ret_values, n)
+        return gmv, (
+            "Risk-free rate exceeds every asset's annualized return; "
+            "tangency portfolio is undefined. Showing GMV weights instead."
+        )
 
     def neg_sharpe(w):
         v = port_vol(w, cov)
@@ -229,10 +239,12 @@ def optimize_tangency(ret_values: np.ndarray, n: int, rf: float):
         constraints=cons,
         options={"ftol": 1e-12, "maxiter": 1000},
     )
-    return res.x if res.success else None
+    if not res.success:
+        gmv = optimize_gmv(ret_values, n)
+        return gmv, "Tangency optimizer failed to converge; showing GMV weights instead."
+    return res.x, None
 
 
-@st.cache_data(show_spinner=False)
 def compute_efficient_frontier(ret_values: np.ndarray, n: int, n_points: int = 60):
     """Constrained optimization at each target return level."""
     ret_df = pd.DataFrame(ret_values)
@@ -775,10 +787,12 @@ with tab_port:
 
     # Tangency
     with st.spinner("Solving tangency (max Sharpe) optimization..."):
-        tan_w = optimize_tangency(ret_values, n, rf)
+        tan_w, tan_warn = optimize_tangency(ret_values, n, rf)
     if tan_w is None:
         st.error("⚠️ Tangency optimizer failed to converge.")
         st.stop()
+    if tan_warn:
+        st.warning(f"⚠️ {tan_warn}")
     tan_m = portfolio_metrics(tan_w, ret, rf)
 
     # ----- Equal-Weight section
@@ -1127,7 +1141,7 @@ with tab_sens:
             sub_n = sub.shape[1]
 
             gmv_sub = optimize_gmv(sub_vals, sub_n)
-            tan_sub = optimize_tangency(sub_vals, sub_n, rf)
+            tan_sub, _ = optimize_tangency(sub_vals, sub_n, rf)
 
             if gmv_sub is None or tan_sub is None:
                 sens_results.append({"Window": label, "Status": "Optimizer failed"})
