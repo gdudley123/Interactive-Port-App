@@ -748,7 +748,7 @@ with tab_corr:
     with st.expander("📋 Show Covariance Matrix (daily returns)"):
         cov_df = ret.cov()
         st.dataframe(
-            cov_df.style.format("{:.6f}").background_gradient(cmap="Blues"),
+            cov_df.style.format("{:.6f}"),
             use_container_width=True,
         )
 
